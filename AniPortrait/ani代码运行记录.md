@@ -701,7 +701,7 @@ forward函数的内在逻辑很简单，输入图像编码以及时间编码，�
 
 ##### Transformer2DModel：
 
-Transformer2DModel由input_layers+Transformer_Block+output_layers(仍需补充)构成
+Transformer2DModel由input_layers+Transformer_Block+output_layers+PixArt-Alpha blocks（这个块应该是用于文生图的，可选）构成
 
 * input_layers其实就是做组归一化+投影/1*1的卷积
 
@@ -712,7 +712,7 @@ Transformer2DModel由input_layers+Transformer_Block+output_layers(仍需补充)�
 
 ###### BasicTransformerBlock:
 
-BasicTransformerBlock其实是 自注意力+控制信息融合（这里不确定）+交叉注意力+前馈层+PixArt-Alpha blocks（这个块应该是用于文生图的，可选）的形式，其中除了在控制信息融合之后没有用残差连接，在其他情况下都用了残差连接。先明确一下在模块中涉及到的重要的参数：hidden_states其实是query，encoder_hidden_states是key/value，看一下具体流程：
+BasicTransformerBlock其实是 自注意力+控制信息融合（这里不确定）+交叉注意力+前馈层的形式，其中除了在控制信息融合之后没有用残差连接，在其他情况下都用了残差连接。先明确一下在模块中涉及到的重要的参数：hidden_states其实是query（图片编码），encoder_hidden_states是key/value（控制信息），看一下具体流程：
 
 1. 自注意力
 
@@ -738,4 +738,80 @@ BasicTransformerBlock其实是 自注意力+控制信息融合（这里不确定
 上面的过程可以用下图表示：
 
 ![v2-2797c76152e6aa44edbaa94af0a41c28_r](C:\Users\Shipu\Desktop\v2-2797c76152e6aa44edbaa94af0a41c28_r.jpg)
+
+##### DualTransformer2DModel：
+
+其实是双重Transformer的包装器，用于混合推理，其结合了两个Transformer2DModel，感觉这个的作用是接收两个控制信息放到两个Transformer编码器中，然后按照比率(mix_ratio)组合得到编码结果
+
+
+
+## Train：
+
+srun --pty --partition=fvl --qos=low --nodelist=fvl14  --gres=gpu:1 -N 1  --mem=40G -n 1 -c 4  --time=3-00:00 bash
+
+### 数据集生成：
+
+```
+python -m scripts.preprocess_dataset --input_dir VFHQ_PATH --output_dir SAVE_PATH --training_json JSON_PATH
+```
+
+实际运行命令：
+
+这里写input_dir要写到图片所在文件夹的上一层 /share/test/shipu/Ani/VFHQ-Test/Blind-LR/Interval5_BlindLR_128x128_LANCZOS4_paper
+
+```
+python -m scripts.preprocess_dataset --input_dir "/share/test/shipu/Ani/VFHQ-Test/Blind-LR/Interval5_BlindLR_128x128_LANCZOS4_paper" --output_dir "/share/test/shipu/Ani/Train_dataset/dataset_2" --training_json "./data/train_2.json"
+```
+
+
+
+
+
+```
+python -m scripts.preprocess_dataset --input_dir "./Blind-LR/Interval5_BlindLR_128x128_LANCZOS4_paper" --output_dir "./Train_dataset" --training_json "./data/train_1.json"
+```
+
+
+
+### 整体流程：
+
+
+
+初始化图像编码器，变分自编码器，reference_net，denoising_unet，pose_guider，并加载模型参数，将模型参数冻结
+
+设置denoising_unet网络中的Motion Module是可训练的（其实就是把requires_grad设置为True）
+
+
+
+train_dataloader每一个是一个字典，字典的键有：
+
+['pixel_values', 'pixel_values_pose', 'clip_ref_image', 'pixel_values_ref_img', 'drop_image_embeds', 'pixel_values_ref_pose']
+
+
+
+```
+(Pdb) p next(iter(train_dataloader)).keys()
+dict_keys(['pixel_values', 'pixel_values_pose', 'clip_ref_image', 'pixel_values_ref_img', 'drop_image_embeds', 'pixel_values_ref_pose'])
+(Pdb) p next(iter(train_dataloader))['pixel_values'].shape
+torch.Size([2, 32, 3, 256, 256])
+(Pdb) p next(iter(train_dataloader))['pixel_values_pose'].shape
+torch.Size([2, 32, 3, 256, 256])
+(Pdb) p next(iter(train_dataloader))['clip_ref_image'].shape
+torch.Size([2, 3, 224, 224])
+(Pdb) p next(iter(train_dataloader))['pixel_values_ref_img'].shape
+torch.Size([2, 3, 256, 256])
+(Pdb) p next(iter(train_dataloader))['drop_image_embeds'].shape
+torch.Size([2])
+(Pdb) p next(iter(train_dataloader))['pixel_values_ref_pose'].shape
+torch.Size([2, 3, 256, 256])
+
+```
+
+
+
+
+
+
+
+
 
