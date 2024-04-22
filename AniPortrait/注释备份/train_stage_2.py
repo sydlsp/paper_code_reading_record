@@ -82,8 +82,27 @@ class Net(nn.Module):
         ref_pose_img,
         uncond_fwd: bool = False,
     ):
+        pdb.set_trace()
+
+        # 驱动视频的动作
         pose_cond_tensor = pose_img.to(device="cuda")
+        # reference image的动作
         ref_pose_tensor = ref_pose_img.to(device="cuda")
+
+        # [batch_size,channels,frames,h,w] [batch_size,channels,h,w]
+
+        # pose_guider输出固定是一个长度为5的列表
+
+        # 在pose_guider中，pose_cond_tensor与ref_pose_tensor是通过交叉注意力机制相互融合的
+
+        # 看一pose_fea每一层输出的形状:
+        # pose_fea[0] [batch_size,320,frames,w/8,h/8]
+        # pose_fea[1] [batch_size,320,frames,w/16,h/16]
+        # pose_fea[2] [batch_size,640,frames,w/32,h/32]
+        # pose_fea[3] [batch_size,1280,frames,w/64,h/64]
+        # pose_fea[4] [batch_size,1280,frames,w/64,h/64]
+        # 注意这里通道数其实是在pose_guider初始化的时候由noise_latent_channels参数确定的，不修改默认的话是上述固定的
+        
         pose_fea = self.pose_guider(pose_cond_tensor, ref_pose_tensor)
 
         if not uncond_fwd:
@@ -558,7 +577,8 @@ def main(cfg):
             with accelerator.accumulate(net):
                 # Convert videos to latent space
                 # 将视频转移到潜在空间中
-                # 从图示上来看是 Reference Image
+                # "pixel_values" 表示的应该是驱动视频
+                # TODO: 这里要确认一下 pixel_values到底是什么
                 pixel_values_vid = batch["pixel_values"].to(weight_dtype)
                 with torch.no_grad():
                     video_length = pixel_values_vid.shape[1]
@@ -569,7 +589,7 @@ def main(cfg):
                     )
                     # 上面的转换是为了作为vae的输入
                     # 利用vae的编码器对输入进行编码
-                    pdb.set_trace()
+
                     latents = vae.encode(pixel_values_vid).latent_dist.sample()
                     # 经过vae的编码器 latents变为[batch_size*frames,4,height/8,width/8]
                     # 下面用height表示原本的height/8，同理对width也是一样
@@ -583,6 +603,7 @@ def main(cfg):
 
                 # 生成噪声
                 noise = torch.randn_like(latents)
+                # 在已有的噪声上加上noise_offset偏移量的噪声
                 if cfg.noise_offset > 0:
                     noise += cfg.noise_offset * torch.randn(
                         (latents.shape[0], latents.shape[1], 1, 1, 1),
@@ -590,6 +611,10 @@ def main(cfg):
                     )
                 bsz = latents.shape[0]
                 # Sample a random timestep for each video
+                # train_noise_scheduler.num_train_timesteps来源于stage2.yaml中
+                # noise_scheduler_kwargs.num_train_timesteps
+
+                #从 0-train_noise_scheduler.num_train_timesteps 之前生成形状为[batch_size]的数据
                 timesteps = torch.randint(
                     0,
                     train_noise_scheduler.num_train_timesteps,
@@ -598,17 +623,29 @@ def main(cfg):
                 )
                 timesteps = timesteps.long()
 
+                # 看示意图的话应该是targetpose images的pixel values
+                # 这里形状的大小依然是[batch_size,frames,channels,height,width]
+                # 注意：这里的channels,height,width是和没有经过vae的驱动视频相同
                 pixel_values_pose = batch["pixel_values_pose"]  # (bs, f, c, H, W)
+
+                #修改一下形状变为[batch_size,channels,frames,height,width]
                 pixel_values_pose = pixel_values_pose.transpose(
                     1, 2
                 )  # (bs, c, f, H, W)
-                
+
+                # reference_pose 形状为[batch_size,channels,height,width]
+                # 注意：这里的channels,height,width是和没有经过vae的驱动视频相同
+                # 看示意图的话确实是只有一张图片
                 pixel_values_ref_pose = batch["pixel_values_ref_pose"]
 
+
+
+                #根据uncond_ratio的值来决定是否做无条件的前向传播
                 uncond_fwd = random.random() < cfg.uncond_ratio
                 clip_image_list = []
                 ref_image_list = []
 
+                # 这里感觉和条件相关
                 for batch_idx, (ref_img, clip_img) in enumerate(
                     zip(
                         batch["pixel_values_ref_img"],
@@ -622,32 +659,51 @@ def main(cfg):
                     ref_image_list.append(ref_img)
 
                 with torch.no_grad():
+                    # ref_img的形状是[batch,channels,height,width]
+                    # channels,height,width依旧是和不经过vae的保持一致
                     ref_img = torch.stack(ref_image_list, dim=0).to(
                         dtype=vae.dtype, device=vae.device
                     )
+
+                    # 经过vae之后变为[batch_size,4,height/8,width/8]
                     ref_image_latents = vae.encode(
                         ref_img
                     ).latent_dist.sample()  # (bs, d, 64, 64)
                     ref_image_latents = ref_image_latents * 0.18215
 
+                    # clip_img是要经过clip编码的reference image
+
+                    # clip_img的形状为[batch_size,channels,224,224] channels=3
                     clip_img = torch.stack(clip_image_list, dim=0).to(
                         dtype=image_enc.dtype, device=image_enc.device
                     )
                     clip_img = clip_img.to(device="cuda", dtype=weight_dtype)
+
+                    #经过clip编码后，clip_image_embeds的形状为[batch_size,768]
                     clip_image_embeds = image_enc(
                         clip_img.to("cuda", dtype=weight_dtype)
                     ).image_embeds
+
+                    #升一下维变成[batch_size,1,768]
                     clip_image_embeds = clip_image_embeds.unsqueeze(1)  # (bs, 1, d)
 
                 # add noise
+
+                # 添加噪声，这里应该是将驱动图像的隐状态(latent)和高斯噪声(noise)混合，同时融入时间信息
                 noisy_latents = train_noise_scheduler.add_noise(
                     latents, noise, timesteps
                 )
                 
                 # Get the target for loss depending on the prediction type
+
+                # 根据train_noise_scheduler.prediction_type的类型来确定训练目标是什么
+                # 这里默认应该是"v_prediction"
                 if train_noise_scheduler.prediction_type == "epsilon":
                     target = noise
                 elif train_noise_scheduler.prediction_type == "v_prediction":
+
+                    # 这里是根据timesteps来取alpha列表中对应序号的值作为alpha的值，根据alpha的值来确定bata的值
+                    # target其实是alpha*noise-bata*latents
                     target = train_noise_scheduler.get_velocity(
                         latents, noise, timesteps
                     )
@@ -657,6 +713,16 @@ def main(cfg):
                     )
 
                 # ---- Forward!!! -----
+
+                # 先复习一下进入net的各个输入数据的形状
+                # noisy_latents [batch_size,4,frames,h/8,w/8]
+                # timesteps [batch_size]
+                # ref_image_latents [batch_size,4,h/8,w/8]
+                # clip_image_embeds [batch_size,1,768]
+                # pixel_values_pose [batch_size,channels,frames,h,w] channels=3
+                # pixel_values_ref_pose [batch_size,channels,h,w] channels=3
+
+
                 model_pred = net(
                     noisy_latents,
                     timesteps,
