@@ -82,7 +82,7 @@ class Net(nn.Module):
         ref_pose_img,
         uncond_fwd: bool = False,
     ):
-        pdb.set_trace()
+
 
         # 驱动视频的动作
         pose_cond_tensor = pose_img.to(device="cuda")
@@ -106,23 +106,29 @@ class Net(nn.Module):
         pose_fea = self.pose_guider(pose_cond_tensor, ref_pose_tensor)
 
         if not uncond_fwd:
+            # 有条件的前向过程，reference image的时间步骤形状和timesteps相同但均为0
             ref_timesteps = torch.zeros_like(timesteps)
-            self.reference_unet(
-                ref_image_latents,
-                ref_timesteps,
-                encoder_hidden_states=clip_image_embeds,
-                return_dict=False,
-            )
+
+            # 看一下reference unet需要的输入为:
+            # ref_image_latents:[batch_size,4,w/8,h/8]
+            # ref_timesteps:[batch_size],内部元素均为0
+            # clip_image_embeds: [batch_size,1,768]
+
+            # 这里有个问题：为什么没有变量接收返回值
+            # 返回值是一个tuple，取元组内的一个值来看一下形状，形状为[batch_size,320,w/8,h/8] 这里的320应该是固定的
+            self.reference_unet(ref_image_latents,ref_timesteps,encoder_hidden_states=clip_image_embeds,return_dict=False,)
             self.reference_control_reader.update(self.reference_control_writer)
         else:
             pass
-        
+        # self.denoising_unet是UNet3DConditionModel
         model_pred = self.denoising_unet(
             noisy_latents,
             timesteps,
             pose_cond_fea=pose_fea,
             encoder_hidden_states=clip_image_embeds,
         ).sample
+
+        #model_pred的形状为[batch_size,4,frames,h/8,w/8],其实是和noisy_latents的形状是一致的
 
         return model_pred
 
@@ -171,6 +177,8 @@ def log_validation(
 ):
     logger.info("Running validation... ")
 
+
+    # accelerator.unwrap_model(net) 获取了未包装的原始模型
     ori_net = accelerator.unwrap_model(net)
     reference_unet = ori_net.reference_unet
     denoising_unet = ori_net.denoising_unet
@@ -178,9 +186,12 @@ def log_validation(
 
     if generator is None:
         generator = torch.manual_seed(42)
+
+    # 创建临时版本的denosing_unt模型，以便用更低的精度进行计算
     tmp_denoising_unet = copy.deepcopy(denoising_unet)
     tmp_denoising_unet = tmp_denoising_unet.to(dtype=torch.float16)
 
+    # 构造流水线，用于将输入的姿势信息转化为视频
     pipe = Pose2VideoPipeline(
         vae=vae,
         image_encoder=image_enc,
@@ -196,8 +207,16 @@ def log_validation(
 
     results = []
     for idx in sample_idx:
+
+        # sample是一个字典，包含['pixel_values_pose', 'ref_img', 'tar_gt', 'pixel_values_ref_pose']
+        # 再看一下各个的形状：
+        # sample['pixel_values_pose']: [frames,h,w,channels=3]
+        # sample['ref_img']: [h,w,channels=3]
+        # sample['tar_gt']: [frames,h,w,channels=3]
+        # sample['pixel_values_ref_pose']: [h,w,channels=3]
         sample = valid_dataset[idx]
 
+        # 将样本中的图像数据转化为PIL图像对象，然后将图像转化为RGB格式
         ref_image_pil = Image.fromarray(sample['ref_img']).convert("RGB")
         pose_images = [Image.fromarray(sample['pixel_values_pose'][idx]).convert("RGB") for idx in range(sample['pixel_values_pose'].shape[0])]
         gt_images = [Image.fromarray(sample['tar_gt'][idx]).convert("RGB") for idx in range(sample['tar_gt'].shape[0])]
@@ -212,8 +231,12 @@ def log_validation(
         gt_tensor_list = []
         pose_list = []
 
+        # clip_length默认是24，现在大小和frames相同
         for pose_image_pil in pose_images[:clip_length]:
+            # 这里其实就是转化为[channels,h,w]
             pose_tensor_list.append(pose_transform(pose_image_pil))
+            # 这里有个细节要仔细看一下ref_tensor_list每次添加的是一样的ref_image_pil
+            # 相当于把ref_image_pil复制了clip_length次
             ref_tensor_list.append(pose_transform(ref_image_pil))
         for gt_image_pil in gt_images[:clip_length]:
             gt_tensor_list.append(pose_transform(gt_image_pil))
@@ -221,15 +244,23 @@ def log_validation(
         pose_list = sample['pixel_values_pose'][:clip_length]
         ref_pose = sample['pixel_values_ref_pose']
 
+        # pose_tensor [frames,channels=3,h,w]
         pose_tensor = torch.stack(pose_tensor_list, dim=0)  # (f, c, h, w)
         pose_tensor = pose_tensor.transpose(0, 1) # (c, f, h, w)
 
+        # ref_tensor [frames,channels=3,h,w]
         ref_tensor = torch.stack(ref_tensor_list, dim=0)  # (f, c, h, w)
         ref_tensor = ref_tensor.transpose(0, 1) # (c, f, h, w)
-        
+
+        # gt_tensor [frames,channels=3,h,w]
         gt_tensor = torch.stack(gt_tensor_list, dim=0)  # (f, c, h, w)
         gt_tensor = gt_tensor.transpose(0, 1) # (c, f, h, w)
 
+        # 看一下往管道里放的是什么：
+        # reference image: 图片！ 这里是真的图片形式的图片 类型为 PIL.Image.Image
+        # pose_list: [frames,h,w,channels=3] np.array
+        # ref_pose: [h,w,channels=3] np.array
+        # pipeline_output的形式类似元组，在实验运行时，取pipeline_output[0]查看其形状为[1,channels=3,frames,h,w]
         pipeline_output = pipe(
             ref_image_pil,
             pose_list,
@@ -241,12 +272,18 @@ def log_validation(
             3.5,
             generator=generator,
         )
+        # video 是tensor [1,channels=3,frames,h,w]
         video = pipeline_output.videos
 
+        pdb.set_trace()
+
         # Concat it with pose tensor
+
+        # 这里都是补充第0维，和video对齐
         pose_tensor = pose_tensor.unsqueeze(0)
         ref_tensor = ref_tensor.unsqueeze(0)
         gt_tensor = gt_tensor.unsqueeze(0)
+        # video[4,channels=3,frames,h,w]
         video = torch.cat([ref_tensor, pose_tensor, video, gt_tensor], dim=0)
 
         results.append({"name": f"sample_{idx}", "vid": video})
@@ -733,24 +770,30 @@ def main(cfg):
                     uncond_fwd=uncond_fwd,
                 )
 
+                # snr_gamma表示图像的信噪比
                 if cfg.snr_gamma == 0:
                     loss = F.mse_loss(
                         model_pred.float(), target.float(), reduction="mean"
                     )
                 else:
+
+                    # snr是形状为[batch_size]的列表，计算结果就先理解为信噪比吧
                     snr = compute_snr(train_noise_scheduler, timesteps)
+
                     if train_noise_scheduler.config.prediction_type == "v_prediction":
                         # Velocity objective requires that we add one to SNR values before we divide by them.
                         snr = snr + 1
                     mse_loss_weights = (
-                        torch.stack(
-                            [snr, cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
-                        ).min(dim=1)[0]
+                        # 下面这一行的意思其实是对应取snr和cfg.snr_gamma中较小的值然后/snr
+                        torch.stack([snr, cfg.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0]
                         / snr
                     )
+
+                    # loss的形状为[batch_size,4,frames,h/8,w/8]
                     loss = F.mse_loss(
                         model_pred.float(), target.float(), reduction="none"
                     )
+                    # loss.mean(dim=list(range(1, len(loss.shape))))算完之后形状变为[batch_size]
                     loss = (
                         loss.mean(dim=list(range(1, len(loss.shape))))
                         * mse_loss_weights
@@ -758,12 +801,16 @@ def main(cfg):
                     loss = loss.mean()
 
                 # Gather the losses across all processes for logging (if we use distributed training).
+                # 收集所有进程中的损失以进行日志记录
                 avg_loss = accelerator.gather(loss.repeat(cfg.train_bs)).mean()
                 train_loss += avg_loss.item() / cfg.solver.gradient_accumulation_steps
 
                 # Backpropagate
+                # 反向传播
                 accelerator.backward(loss)
+
                 if accelerator.sync_gradients:
+                    # 调用clip_grad_norm_对可训练参数应用梯度裁剪
                     accelerator.clip_grad_norm_(
                         trainable_params,
                         cfg.solver.max_grad_norm,
@@ -773,6 +820,7 @@ def main(cfg):
                 optimizer.zero_grad()
 
             if accelerator.sync_gradients:
+
                 reference_control_reader.clear()
                 reference_control_writer.clear()
                 
@@ -786,6 +834,7 @@ def main(cfg):
                         generator = torch.Generator(device=accelerator.device)
                         generator.manual_seed(cfg.seed)
 
+                        # log_validation 随机抽取验证数据集的样本，返回处理过的验证结果
                         sample_dicts = log_validation(
                             vae=vae,
                             image_enc=image_enc,
