@@ -745,7 +745,7 @@ BasicTransformerBlock其实是 自注意力+控制信息融合（这里不确定
 
 
 
-## Train：
+## Train_stage_2：
 
 srun --pty --partition=fvl --qos=low --nodelist=fvl14  --gres=gpu:1 -N 1  --mem=40G -n 1 -c 4  --time=3-00:00 bash
 
@@ -777,6 +777,8 @@ python -m scripts.preprocess_dataset --input_dir "./Blind-LR/Interval5_BlindLR_1
 
 
 
+#### 准备阶段：
+
 初始化图像编码器，变分自编码器，reference_net，denoising_unet，pose_guider，并加载模型参数，将模型参数冻结
 
 设置denoising_unet网络中的Motion Module是可训练的（其实就是把requires_grad设置为True）
@@ -787,21 +789,34 @@ train_dataloader每一个是一个字典，字典的键有：
 
 ['pixel_values', 'pixel_values_pose', 'clip_ref_image', 'pixel_values_ref_img', 'drop_image_embeds', 'pixel_values_ref_pose']
 
+看一下维度表示的含义：
 
+* 第一维batch_size：2
+* 第二维sample_n_frames：32
+* 第三维channels：3
+* 第四和第五维：sample_size  [256,256]
+
+以上参数可以在stage2.yaml中修改
 
 ```
 (Pdb) p next(iter(train_dataloader)).keys()
 dict_keys(['pixel_values', 'pixel_values_pose', 'clip_ref_image', 'pixel_values_ref_img', 'drop_image_embeds', 'pixel_values_ref_pose'])
+
 (Pdb) p next(iter(train_dataloader))['pixel_values'].shape
 torch.Size([2, 32, 3, 256, 256])
+
 (Pdb) p next(iter(train_dataloader))['pixel_values_pose'].shape
 torch.Size([2, 32, 3, 256, 256])
+
 (Pdb) p next(iter(train_dataloader))['clip_ref_image'].shape
 torch.Size([2, 3, 224, 224])
+
 (Pdb) p next(iter(train_dataloader))['pixel_values_ref_img'].shape
 torch.Size([2, 3, 256, 256])
+
 (Pdb) p next(iter(train_dataloader))['drop_image_embeds'].shape
 torch.Size([2])
+
 (Pdb) p next(iter(train_dataloader))['pixel_values_ref_pose'].shape
 torch.Size([2, 3, 256, 256])
 
@@ -809,9 +824,27 @@ torch.Size([2, 3, 256, 256])
 
 
 
+在准备阶段涉及到两个数字的计算：每个训练周期的更新步数以及总的训练周期的轮数
+
+* 每个训练周期的更新步数：batch数/在执行一次参数更新前要累积批次的数目，使用这样的梯度累积策略可以模拟更大批量的训练但不增加实际内存的使用
+* 计算总的训练周期的轮数(算有多少个epoch)：总的最大训练步数/每个训练周期的更新步数
 
 
 
+#### Train：
+
+在训练阶段一开始涉及到计算总的batch_size大小、从之前保存的检查点恢复训练过程以及创建读条的相关代码
 
 
 
+下面进入主体部分：
+
+1. 将视频转移到潜在空间中，为了使用vae的编码器对视频进行编码，要将batch["pixel_values"]（视频）的形状从[batch,frames,channels,height,width]转化为[batch_size* frames,channels,height,width]，在经过vae的编码后latents的形状变为 [batch_size* frames,4,height/8,width/8]，接下来再把形状转化为[batch_size,channels,frames,height,width]，这里channels=4
+2. 生成噪声noise，噪声的形状与latents相同，如果需要偏移量的话，就在已有的噪声上添加noise_offset偏移量的噪声
+3. 生成timesteps：timestep是形状为[batch_size]的int型随机列表，表中数字来源于0-num_train_steps
+4. 读取驱动视频的pose：batch["pixel_values_pose"]形状为[batch_size,frames,channels,h,w]  读取reference image的pose 形状为[batch_size,channels,h,w]
+5. 根据uncond_fwd的值来决定是否做无条件的前向传播，如果是做无条件前向传播的话 clip_image_list列表中加入的是和clip_image形状相同的零张量，clip_image_list可以理解为需要放入clip图像编码器中的reference image图像编码，clip_image的形状为[batch_size,channels,224,224]
+6. 将reference image放入vae中得到ref_image_latents,reference_image的形状从[batch_size,channels,h,w]转化为[batch_size,4,h/8,w/8]
+7. clip_image经过clip的图像编码器形状从[batch_size,channels,224,224]变为[batch_size,768]，再升维得到[batch_size,1,768]
+8. noisy_latents的生成：noisy_latents由驱动视频latents，噪声noise,以及时间步timesteps联合生成（其实是生成输入了）
+9. 目标生成：在生成目标的时候默认的模式是"v_prediction"，按照这样的方式来生成目标的话，目标同样由驱动视频latents，噪声noise,以及时间步timesteps联合生成（这儿为什么要这样生成目标有点疑问）
