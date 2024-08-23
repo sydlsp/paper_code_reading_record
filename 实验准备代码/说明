@@ -1,0 +1,3 @@
+Ani_stage_2用的是ani虚拟环境
+pytorch3d部分用的是ssh远程环境gta_1
+其他是py39_gpu

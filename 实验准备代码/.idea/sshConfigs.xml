@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SshConfigs">
+    <configs>
+      <sshConfig connectionConfig="{&quot;serverAliveInterval&quot;:300}" host="10.176.42.5" id="4ebbb9a2-5f93-4ae5-b668-e7f9ae5f8121" keyPath="C:\Users\Shipu\id_rsa_5" port="20032" customName="song" nameFormat="CUSTOM" username="root" useOpenSSHConfig="true">
+        <option name="customName" value="song" />
+      </sshConfig>
+    </configs>
+  </component>
+</project>
